@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,8 +43,48 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+# Longer inputs are rejected before any regex/LLM work (cost + smuggling guard)
+MAX_INPUT_CHARS = 2000
+
+# Zero-width / invisible characters attackers insert to split keywords
+_INVISIBLE_CHARS = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+
+INJECTION_PATTERNS = [
+    # Override previous instructions (EN)
+    r"\b(ignore|disregard|forget|override)\s+(all\s+|any\s+)?(of\s+)?(the\s+|your\s+)?"
+    r"(previous|above|prior|earlier|system)?\s*(instructions?|rules?|directives?|guidelines?)",
+    # Persona switch / jailbreak personas
+    r"\byou\s+are\s+now\b",
+    r"\bpretend\s+(you\s+are|to\s+be)\b",
+    r"\bact\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|evil)",
+    r"\b(DAN|developer\s+mode)\b",
+    # System prompt / hidden instruction extraction
+    r"\bsystem\s+prompt\b",
+    r"\breveal\s+(your\s+|the\s+)?(instructions?|prompt|internal|secrets?|password|config)",
+    # Vietnamese variants (compared after accent stripping)
+    r"\bbo\s+qua\s+(moi\s+|tat\s+ca\s+)?(cac\s+)?(huong\s+dan|chi\s+dan|quy\s+tac)",
+    r"\btiet\s+lo\s+(mat\s+khau|api|system\s+prompt|thong\s+tin\s+noi\s+bo)",
+]
+
+
+def normalize_text(text: str) -> str:
+    """Canonicalize Unicode (NFKC), drop invisible chars, strip accents, collapse spaces."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = text.translate(str.maketrans("", "", _INVISIBLE_CHARS))
+    text = text.replace("đ", "d").replace("Đ", "D")
+    text = "".join(
+        ch for ch in unicodedata.normalize("NFKD", text)
+        if not unicodedata.combining(ch)
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
+
+    Text is normalized first so ``Ignore\u200b all previous instructions``
+    is caught. Summarising external email/RAG data is allowed as long as the
+    embedded text does not try to override instructions.
 
     Args:
         user_input: The user's message
@@ -51,14 +92,9 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
+    normalized = normalize_text(user_input)
     for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+        if re.search(pattern, normalized, re.IGNORECASE):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +120,17 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = normalize_text(user_input).lower()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    # Word-boundary prefix match: "hack" hits "hacking" but "kill" misses "skill"
+    def _mentions(keyword: str) -> bool:
+        return re.search(r"\b" + re.escape(keyword), input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(_mentions(topic) for topic in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_mentions(topic) for topic in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -112,6 +151,7 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         super().__init__(name="input_guardrail")
         self.blocked_count = 0
         self.total_count = 0
+        self.last_layer: str | None = None
 
     def _extract_text(self, content: types.Content) -> str:
         """Extract plain text from a Content object."""
@@ -144,14 +184,40 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        self.last_layer = None
 
-        pass  # Replace with your implementation
+        if not text.strip():
+            self.blocked_count += 1
+            self.last_layer = "input_empty"
+            return self._block_response(
+                "Please enter a question about your VinBank account or services."
+            )
+
+        if len(text) > MAX_INPUT_CHARS:
+            self.blocked_count += 1
+            self.last_layer = "input_length"
+            return self._block_response(
+                f"Your message is too long (max {MAX_INPUT_CHARS} characters). "
+                "Please shorten your banking question."
+            )
+
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_layer = "input_injection"
+            return self._block_response(
+                "Request blocked: it looks like an attempt to change my instructions. "
+                "I can only help with VinBank banking questions."
+            )
+
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            self.last_layer = "input_topic"
+            return self._block_response(
+                "Sorry, I can only help with banking topics such as accounts, "
+                "transfers, savings, loans and credit cards."
+            )
+
+        return None
 
 
 # ============================================================
